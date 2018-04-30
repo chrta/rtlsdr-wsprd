@@ -1,4 +1,4 @@
 *.o
-rtlsdr_wsprd
+soapysdr_wsprd
 wspr_wisdom.dat
 hashtable.txt

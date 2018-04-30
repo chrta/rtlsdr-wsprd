@@ -41,9 +41,10 @@
 #include <pthread.h>
 #include <curl/curl.h>
 #include <pthread.h>
-#include <rtl-sdr.h>
+#include <SoapySDR/Device.h>
+#include <SoapySDR/Formats.h>
 
-#include "rtlsdr_wsprd.h"
+#include "soapysdr_wsprd.h"
 #include "wsprd.h"
 
 /* TODO
@@ -66,8 +67,6 @@ struct receiver_state   rx_state;
 struct receiver_options rx_options;
 struct decoder_options  dec_options;
 struct decoder_results  dec_results[50];
-static rtlsdr_dev_t *rtl_device = NULL;
-
 
 /* Thread stuff for separate decoding */
 struct decoder_state {
@@ -87,9 +86,8 @@ struct dongle_state {
 };
 struct dongle_state dongle;
 
-
 /* Callback for each buffer received */
-static void rtlsdr_callback(unsigned char *samples, uint32_t samples_count, void *ctx) {
+static void soapysdr_callback(unsigned char *samples, uint32_t samples_count) {
     int8_t *sigIn = (int8_t*) samples;
     uint32_t sigLenght = samples_count;
 
@@ -225,12 +223,42 @@ static void rtlsdr_callback(unsigned char *samples, uint32_t samples_count, void
     }
 }
 
-
 /* Thread for RX blocking function */
-static void *rtlsdr_rx(void *arg) {
-    /* Read & blocking call */
-    rtlsdr_read_async(rtl_device, rtlsdr_callback, NULL, 0, DEFAULT_BUF_LENGTH);
-    exit(0);
+static void *soapysdr_rx(void *arg) {
+     SoapySDRDevice *sdr = (SoapySDRDevice *) arg;
+     //setup a stream (compatible with rtlsdr)
+    SoapySDRStream *rxStream;
+    if (SoapySDRDevice_setupStream(sdr, &rxStream, SOAPY_SDR_RX, SOAPY_SDR_CS8, NULL, 0, NULL) != 0)
+    {
+        fprintf(stderr, "setupStream fail: %s\n", SoapySDRDevice_lastError());
+	//TODO: baaad
+	exit(1);
+    }
+
+    SoapySDRDevice_activateStream(sdr, rxStream, 0, 0, 0); //start streaming
+
+    //create a re-usable buffer for rx samples
+    uint8_t buff[DEFAULT_BUF_LENGTH];
+
+    //receive some samples
+    while (!rx_state.exit_flag)
+    {
+        void *buffs[] = {buff}; //array of buffers
+        int flags; //flags set by receive operation
+        long long timeNs; //timestamp for receive buffer
+        int ret = SoapySDRDevice_readStream(sdr, rxStream, buffs, DEFAULT_BUF_LENGTH / 2, &flags, &timeNs, 100000);
+        //printf("ret=%d, flags=%d, timeNs=%lld\n", ret, flags, timeNs);
+        if (ret > 0) {
+            soapysdr_callback(buff, ret * 2);
+        } else {
+            //TODO print error code
+            break;
+        }
+    }
+
+    //shutdown the stream
+    SoapySDRDevice_deactivateStream(sdr, rxStream, 0, 0); //stop streaming
+    SoapySDRDevice_closeStream(sdr, rxStream);
     return 0;
 }
 
@@ -494,9 +522,7 @@ void usage(void) {
 int main(int argc, char** argv) {
     uint32_t opt;
 
-    int32_t  rtl_result;
-    int32_t  rtl_count;
-    char     rtl_vendor[256], rtl_product[256], rtl_serial[256];
+    size_t   length;
 
     initrx_options();
     initDecoder_options();
@@ -603,92 +629,84 @@ int main(int argc, char** argv) {
     signal(SIGABRT, &sigint_callback_handler);
 
     /* Init & parameter the device */
-    rtl_count = rtlsdr_get_device_count();
-    if (!rtl_count) {
+    SoapySDRKwargs *results = SoapySDRDevice_enumerate(NULL, &length);
+    if (!length) {
         fprintf(stderr, "No supported devices found\n");
         return EXIT_FAILURE;
     }
 
 
-    fprintf(stderr, "Found %d device(s):\n", rtl_count);
-    for (uint32_t i=0; i<rtl_count; i++) {
-        rtlsdr_get_device_usb_strings(i, rtl_vendor, rtl_product, rtl_serial);
-        fprintf(stderr, "  %d:  %s, %s, SN: %s\n", i, rtl_vendor, rtl_product, rtl_serial);
-    }
-    fprintf(stderr, "\nUsing device %d: %s\n", rx_options.device, rtlsdr_get_device_name(rx_options.device));
-
-
-    rtl_result = rtlsdr_open(&rtl_device, rx_options.device);
-    if (rtl_result < 0) {
-        fprintf(stderr, "ERROR: Failed to open rtlsdr device #%d.\n", rx_options.device);
-        return EXIT_FAILURE;
-    }
-
-    if (rx_options.directsampling) {
-        rtl_result = rtlsdr_set_direct_sampling(rtl_device, rx_options.directsampling);
-        if (rtl_result < 0) {
-            fprintf(stderr, "ERROR: Failed to set direct sampling\n");
-            rtlsdr_close(rtl_device);
-            return EXIT_FAILURE;
+    fprintf(stderr, "Found %ld device(s):\n", length);
+    for (size_t i = 0; i < length; i++) {
+	fprintf(stderr, "Found device #%d: ", (int)i);
+	for (size_t j = 0; j < results[i].size; j++)
+        {
+            fprintf(stderr, "%s=%s, ", results[i].keys[j], results[i].vals[j]);
         }
+        fprintf(stderr, "\n");
     }
+    SoapySDRKwargsList_clear(results, length);
 
-    rtl_result = rtlsdr_set_sample_rate(rtl_device, SAMPLING_RATE);
-    if (rtl_result < 0) {
-        fprintf(stderr, "ERROR: Failed to set sample rate\n");
-        rtlsdr_close(rtl_device);
+     //create device instance
+    //args can be user defined or from the enumeration result
+    SoapySDRKwargs args = {};
+    //open the first one (index 0)
+    //TODO: implement for other device indices
+    SoapySDRDevice *sdr = SoapySDRDevice_make(&args);
+    SoapySDRKwargs_clear(&args);
+
+    if (sdr == NULL)
+    {
+        fprintf(stderr, "SoapySDRDevice_make fail: %s\n", SoapySDRDevice_lastError());
         return EXIT_FAILURE;
     }
 
+    //fprintf(stderr, "\nUsing device %d: %s\n", rx_options.device, rtlsdr_get_device_name(rx_options.device));
 
-    rtl_result = rtlsdr_set_tuner_gain_mode(rtl_device, 1);
-    if (rtl_result < 0) {
-        fprintf(stderr, "ERROR: Failed to enable manual gain\n");
-        rtlsdr_close(rtl_device);
+    if (SoapySDRDevice_setSampleRate(sdr, SOAPY_SDR_RX, 0, SAMPLING_RATE) != 0)
+    {
+        fprintf(stderr, "setSampleRate fail: %s\n", SoapySDRDevice_lastError());
+        SoapySDRDevice_unmake(sdr);
         return EXIT_FAILURE;
     }
 
+    if (SoapySDRDevice_setGainMode(sdr, SOAPY_SDR_RX, 0, false) != 0)
+    {
+        fprintf(stderr, "ERROR: Failed to enable manual gain: %s\n", SoapySDRDevice_lastError());
+	SoapySDRDevice_unmake(sdr);
+        return EXIT_FAILURE;
+    }
 
     if (rx_options.autogain) {
-        rtl_result = rtlsdr_set_tuner_gain_mode(rtl_device, 0);
-        if (rtl_result != 0) {
-            fprintf(stderr, "ERROR: Failed to set tuner gain\n");
-            rtlsdr_close(rtl_device);
+	if (SoapySDRDevice_setGainMode(sdr, SOAPY_SDR_RX, 0, true) != 0)
+        {
+            fprintf(stderr, "ERROR: Failed to enable automatic gain: %s\n", SoapySDRDevice_lastError());
+	    SoapySDRDevice_unmake(sdr);
             return EXIT_FAILURE;
         }
     } else {
-        rtl_result = rtlsdr_set_tuner_gain(rtl_device, rx_options.gain);
-        if (rtl_result != 0) {
-            fprintf(stderr, "ERROR: Failed to set tuner gain\n");
-            rtlsdr_close(rtl_device);
+	if (SoapySDRDevice_setGain(sdr, SOAPY_SDR_RX, 0, rx_options.gain) != 0)
+        {
+            fprintf(stderr, "ERROR: Failed to set gain: %s\n", SoapySDRDevice_lastError());
+	    SoapySDRDevice_unmake(sdr);
             return EXIT_FAILURE;
         }
     }
-
 
     if (rx_options.ppm != 0) {
-        rtl_result = rtlsdr_set_freq_correction(rtl_device, rx_options.ppm);
-        if (rtl_result < 0) {
-            fprintf(stderr, "ERROR: Failed to set ppm error\n");
-            rtlsdr_close(rtl_device);
+       if (SoapySDRDevice_setFrequencyCorrection(sdr, SOAPY_SDR_RX, 0, rx_options.ppm) != 0)
+        {
+            fprintf(stderr, "ERROR: Failed to set frequency correction: %s\n", SoapySDRDevice_lastError());
+	    SoapySDRDevice_unmake(sdr);
             return EXIT_FAILURE;
         }
     }
 
-
-    rtl_result = rtlsdr_set_center_freq(rtl_device, rx_options.realfreq + FS4_RATE + 1500);
-    if (rtl_result < 0) {
-        fprintf(stderr, "ERROR: Failed to set frequency\n");
-        rtlsdr_close(rtl_device);
-        return EXIT_FAILURE;
-    }
-
-
-    rtl_result = rtlsdr_reset_buffer(rtl_device);
-    if (rtl_result < 0) {
-        fprintf(stderr, "ERROR: Failed to reset buffers.\n");
-        rtlsdr_close(rtl_device);
-        return EXIT_FAILURE;
+if (SoapySDRDevice_setFrequency(sdr, SOAPY_SDR_RX, 0, rx_options.realfreq + FS4_RATE + 1500, NULL) != 0)
+    {
+        fprintf(stderr, "ERROR: Failed to set frequency: %s\n", SoapySDRDevice_lastError());
+	SoapySDRDevice_unmake(sdr);
+	return EXIT_FAILURE;
     }
 
     /* Print used parameter */
@@ -730,7 +748,7 @@ int main(int argc, char** argv) {
     pthread_rwlock_init(&dec.rw, NULL);
     pthread_cond_init(&dec.ready_cond, NULL);
     pthread_mutex_init(&dec.ready_mutex, NULL);
-    pthread_create(&dongle.thread, NULL, rtlsdr_rx, NULL);
+    pthread_create(&dongle.thread, NULL, soapysdr_rx, sdr);
     pthread_create(&dec.thread, &dec.tattr, wsprDecoder, NULL);
 
 
@@ -760,11 +778,8 @@ int main(int argc, char** argv) {
         nLoop++;
     }
 
-    /* Stop the RX and free the blocking function */
-    rtlsdr_cancel_async(rtl_device);
-
-    /* Close the RTL device */
-    rtlsdr_close(rtl_device);
+    /* Close the sdr device */
+    SoapySDRDevice_unmake(sdr);
 
     printf("Bye!\n");
 
